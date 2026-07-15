@@ -33,7 +33,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -164,21 +166,226 @@ def _node_id_of(s):
 
 
 # --------------------------------------------------------------------------- #
-#  钉钉 markdown 归一化(反解 adoc 转义层)
+#  钉钉 markdown 保真:归一化 + 容忍钉钉重序列化的对比 + 反棘轮
+#  —— 直接沿用 agent-skills/tools/multica_sync.py 踩过一堆坑之后的实现,别重犯:
+#     钉钉会重排版(标题吞行内代码、表格分隔线补齐、加粗边界重写、段落合并、`_` 转义、
+#     代码块里 HTML 实体【双重】转义并逐轮恶化成棘轮)。逐行 diff 必假报,裸 markdown
+#     写回必失真。对策:两侧对称反解 + 渲染等价对比 + 写回走钉钉自己的解析器。
 # --------------------------------------------------------------------------- #
-def normalize_dingtalk_markdown(content):
-    content = html.unescape(content or "")
+def _normalize_source_markdown(value):
+    value = (value or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [re.sub(r"[ \t]+$", "", ln) for ln in value.split("\n")]
+    return "\n".join(lines).strip()
+
+
+def _unescape_adoc(value):
+    """反解一层 adoc 转义(\\_ \\* \\| ...),保留源文件里真正的反斜杠。"""
     sentinel = "@@DWS_BACKSLASH@@"
-    content = content.replace("\\\\", sentinel)
-    content = re.sub(r"\\([+\[\]_><{}().$|])", r"\1", content)
-    return content.replace(sentinel, "\\")
+    value = (value or "").replace("\\\\", sentinel)
+    value = re.sub(r"\\([+\[\]_><{}().$|])", r"\1", value)
+    return value.replace(sentinel, "\\")
+
+
+def _html_unescape_fully(value):
+    """钉钉在代码块里会【双重】HTML 转义(`&amp;#95;` = `_`),一次 unescape 解不完。
+    收敛式反解到不再变化为止(设上限防病态输入死循环)。"""
+    v = value or ""
+    for _ in range(5):
+        nxt = html.unescape(v)
+        if nxt == v:
+            break
+        v = nxt
+    return v
+
+
+def normalize_dingtalk_markdown(value):
+    """把钉钉回读的 markdown 反解成干净源码 —— 物化到本地/推给 Multica 前都过这道。
+    旧实现只 html.unescape 一次,会留下 `&#95;` 残渣(失真);现在收敛反解 + 对称去 adoc 转义。"""
+    return _normalize_source_markdown(_unescape_adoc(_html_unescape_fully(value)))
+
+
+def _render_equivalent(value):
+    """渲染等价视图:折叠钉钉自动 linkify 的 [文本](节点URL)、去行内强调符、归一化表格
+    分隔线与空白 —— 把「钉钉重排版」这类表现层差异和「内容真被改」区分开。"""
+    v = re.sub(r"[（(]?\[打开\]\(https://alidocs\.dingtalk\.com/[^)]*\)[)）]?", "", value or "")
+    v = re.sub(r"\[([^\]]*)\]\(https://alidocs\.dingtalk\.com/[^)]*\)", r"\1", v)
+    v = re.sub(r"\*{1,3}", "", v)          # 钉钉会重排加粗边界
+    v = re.sub(r"^\s*>\s?", "", v)         # 钉钉会丢引用块的 > 前缀
+    v = re.sub(r"-{2,}", "-", v)           # 表格分隔行 |----| 被重排成 |---|
+    v = re.sub(r"[ \t]+", "", v)
+    return v
+
+
+def _markdown_content_lines(value):
+    """比对时容忍钉钉对外层空行的压缩(代码块内原样保留)。"""
+    lines, fence = [], None
+    for line in value.split("\n"):
+        stripped = line.lstrip()
+        marker = next((m for m in ("```", "~~~") if stripped.startswith(m)), None)
+        if marker:
+            lines.append(line)
+            fence = None if fence == marker else marker
+        elif line.strip() or fence:
+            lines.append(line)
+    return tuple(lines)
+
+
+def dingtalk_matches_source(remote, source):
+    """True=严格一致 / "render"=仅表现层差异 / False=真漂移。两侧都反解,避免源文件里
+    一个 \\_ 就永久假报漂移。"""
+    r = _markdown_content_lines(normalize_dingtalk_markdown(remote))
+    s = _markdown_content_lines(normalize_dingtalk_markdown(source))
+    if r == s:
+        return True
+    if "".join(_render_equivalent(x) for x in r) == "".join(_render_equivalent(x) for x in s):
+        return "render"
+    return False
+
+
+def _unratchet(md):
+    """拆 HTML 实体棘轮:钉钉把行内代码里的 `_`/`*`/反引号转义,回读再写回会一层层恶化
+    (最坏烂到 8 层 → 正文乱码且再也同步不进)。写回前一律拆干净。"""
+    md = re.sub(r"&(?:amp;)*#42;", "*", md)
+    md = re.sub(r"&(?:amp;)*#95;", "_", md)
+    md = re.sub(r"&(?:amp;)*#96;", "`", md)
+    md = re.sub(r"`\*\*([^`\n]+?)\*\*`", r"`\1`", md)
+    return md
 
 
 def _text_equal(a, b):
-    def norm(v):
-        v = normalize_dingtalk_markdown(v or "").replace("\r\n", "\n")
-        return "\n".join(line.rstrip() for line in v.split("\n")).strip()
-    return norm(a) == norm(b)
+    """Multica 侧内容(非钉钉,不会重序列化)与本地物化的一致判断:只容忍空白/换行差异。"""
+    return _normalize_source_markdown(a) == _normalize_source_markdown(b)
+
+
+# --------------------------------------------------------------------------- #
+#  往钉钉写回(Multica → 钉钉):保真写入 = 钉钉原生解析器渲 JSONML + 乐观锁 + 回读
+# --------------------------------------------------------------------------- #
+def _read_dingtalk_doc(node_id):
+    """读钉钉正文 + revision(乐观锁用)。返回 (markdown, revision, error)。"""
+    ver, vrc = dws(["doc", "read", "--node", node_id, "--content-format", "jsonml"])
+    revision = ver.get("revision") if isinstance(ver, dict) else None
+    if vrc != 0 or not revision or ver.get("error"):
+        return None, None, (ver.get("error") or ver.get("_raw") or vrc)
+    out, rc = dws(["doc", "read", "--node", node_id])
+    if rc == 0 and not out.get("error") and "markdown" in out:
+        return out["markdown"], revision, None
+    return None, None, (out.get("error") or out.get("_raw") or rc)
+
+
+def _read_dingtalk_jsonml(node_id):
+    out, rc = dws(["doc", "read", "--node", node_id, "--content-format", "jsonml"])
+    if rc == 0 and not out.get("error") and "jsonml" in out:
+        return out["jsonml"], None
+    return None, (out.get("error") or out.get("_raw") or rc)
+
+
+def _render_markdown_jsonml(target_node, content):
+    """用钉钉自己的 Markdown 解析器把 content 渲成「干净可回写」的 JSONML:
+    在目标同目录建临时文档 → 写 markdown → 回读 JSONML → 删临时文档。
+    绕开「裸 markdown 直接写回被重排版失真」。返回 (jsonml, error)。"""
+    content = _unratchet(content)
+    info, irc = dws(["doc", "info", "--node", target_node])
+    folder_id = _dig(info, "folderId")
+    if irc != 0 or not folder_id or info.get("error"):
+        return None, "目标目录查询失败"
+    scratch_name = "dtsync-render-" + uuid.uuid4().hex
+    scratch, rendered, error, tmp = None, None, None, None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".md", delete=False) as f:
+            f.write(content)
+            tmp = f.name
+        created, _ = dws(["doc", "create", "--name", scratch_name, "--folder", folder_id, "--yes"])
+        scratch = _dig(created, "nodeId", "dentryUuid", "fileId")
+        # 铁律:doc create 会【报错但其实建成功】—— 不看信封,按名回查
+        for attempt in range(3):
+            if scratch:
+                break
+            time.sleep(0.8 * (attempt + 1))
+            listed, lrc = dws(["doc", "list", "--folder", folder_id])
+            if lrc == 0 and isinstance(listed, dict):
+                scratch = next((it.get("nodeId") for it in (listed.get("nodes") or [])
+                                if it.get("name") == scratch_name), None)
+        if not scratch:
+            return None, "临时文档创建无返回"
+        matched = False
+        for attempt in range(3):
+            dws(["doc", "update", "--node", scratch, "--content-file", tmp,
+                 "--content-format", "markdown", "--mode", "overwrite", "--yes"])
+            back, brc = dws(["doc", "read", "--node", scratch])
+            matched = (brc == 0 and not back.get("error")
+                       and dingtalk_matches_source(back.get("markdown", ""), content) is not False)
+            if matched:
+                break
+            time.sleep(0.8 * (attempt + 1))
+        if not matched:
+            error = "临时文档 markdown 回读不匹配"
+        else:
+            tree, trc = dws(["doc", "read", "--node", scratch, "--content-format", "jsonml"])
+            if trc != 0 or tree.get("error") or not tree.get("jsonml"):
+                error = "临时文档 JSONML 读取失败"
+            else:
+                rendered = tree["jsonml"]
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+        if scratch:
+            d, drc = dws(["doc", "delete", "--node", scratch, "--yes"])
+            if drc != 0 or d.get("error") or d.get("success") is False:
+                error = error or f"临时文档清理失败: {scratch}"
+                rendered = None
+    return rendered, error
+
+
+def dingtalk_write_decision(baseline, latest, expected):
+    """写/免写/冲突:防止盖掉钉钉侧的并发编辑。"""
+    baseline = normalize_dingtalk_markdown(baseline)
+    latest = normalize_dingtalk_markdown(latest)
+    expected = _normalize_source_markdown(expected)
+    if latest == expected:
+        return "already"
+    if latest != baseline:
+        return "conflict"
+    return "write"
+
+
+def _write_dingtalk_node(node_id, expected_content, baseline_remote):
+    """把 expected_content 保真写回钉钉 node。返回 (status, msg):
+    status ∈ already / written / conflict / failed。"""
+    rendered, rerr = _render_markdown_jsonml(node_id, expected_content)
+    if rerr:
+        return "failed", f"Markdown→JSONML 失败: {rerr}"
+    latest, revision, read_err = _read_dingtalk_doc(node_id)
+    if read_err:
+        return "failed", f"写前复读失败: {read_err}"
+    decision = dingtalk_write_decision(baseline_remote, latest, expected_content)
+    if decision == "already":
+        return "already", "已一致"
+    if decision == "conflict":
+        return "conflict", "初读后钉钉侧又变了,拒绝覆盖(防丢并发编辑)"
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", delete=False) as f:
+            json.dump({"jsonml": rendered}, f, ensure_ascii=False)
+            tmp = f.name
+        out, rc = dws(["doc", "update", "--node", node_id, "--content-file", tmp,
+                       "--content-format", "jsonml", "--mode", "overwrite",
+                       "--revision", str(revision), "--yes"])
+        updated = rc == 0 and not out.get("error")
+        back, after_rev, berr = _read_dingtalk_doc(node_id)
+        content_ok = not berr and dingtalk_matches_source(back or "", expected_content) is not False
+        back_tree, terr = _read_dingtalk_jsonml(node_id)
+        jsonml_ok = not terr and back_tree == rendered
+        try:
+            rev_ok = int(after_rev) == int(revision) + 1
+        except (TypeError, ValueError):
+            rev_ok = False
+        ok = updated and content_ok and jsonml_ok and rev_ok
+        return ("written" if ok else "failed",
+                f"revision {revision}→{after_rev}, jsonml={'exact' if jsonml_ok else 'drift'}, "
+                f"content={'ok' if content_ok else 'drift'}")
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 # --------------------------------------------------------------------------- #
@@ -277,8 +484,10 @@ def _leaf_name(node):
 
 
 def discover(root, include, exclude):
-    """BFS 发现 work 范围内的叶子文档,并记录被有意跳过的动态节点与二进制。"""
+    """BFS 发现 work 范围内的叶子文档,并记录被有意跳过的动态节点与二进制。
+    同时收集文件夹 rel→folderId(供 Multica→钉钉 写回时定位/新建节点)。"""
     files, folders, truncated = [], [], []
+    folder_ids = {"": root}
     skipped_dynamic, skipped_binary = [], []
     level = [("", root)]
     while level:
@@ -296,6 +505,7 @@ def discover(root, include, exclude):
                 if is_folder:
                     if _should_descend(rel, include, exclude):
                         folders.append(rel)
+                        folder_ids[rel] = child["nodeId"]
                         nxt.append((rel, child["nodeId"]))
                     else:
                         skipped_dynamic.append(rel + "/")
@@ -311,6 +521,7 @@ def discover(root, include, exclude):
         level = nxt
     discover.skipped_dynamic = sorted(set(skipped_dynamic))
     discover.skipped_binary = sorted(set(skipped_binary))
+    discover.folder_ids = folder_ids
     return files, folders, truncated
 
 
@@ -325,7 +536,7 @@ def _fetch(item):
     return {"rel": rel, "content": None, "error": f"非在线文档({ext or '?'}),跳过"}
 
 
-def pull(cfg, work_dir, force):
+def pull(cfg, work_dir, force, config_path=None):
     root = cfg["dingtalk"]["source_node"]
     include, exclude = cfg["sync"]["include"], cfg["sync"]["exclude"]
 
@@ -373,6 +584,19 @@ def pull(cfg, work_dir, force):
         print(f"  ⚠️ 本次物化不完整: {truncated}")
     if not entry_ok:
         raise ConfigError(f"入口文档 {entry} 没拉到,拒绝继续。核对 source_node 与 entry。")
+
+    # 记住 rel→钉钉节点 的映射 —— Multica→钉钉 写回时靠它定位每份文档写去哪。
+    if config_path:
+        node_map = {rel: node.get("nodeId") for rel, node in files if node.get("nodeId")}
+        state = _load_state(config_path)
+        state["dingtalk"] = {
+            "root": root,
+            "entry": entry,
+            "entry_node": node_map.get(entry),
+            "nodes": node_map,
+            "folders": getattr(discover, "folder_ids", {"": root}),
+        }
+        _save_state(config_path, state)
     return {"written": written, "truncated": truncated}
 
 
@@ -592,6 +816,131 @@ def push(cfg, work_dir, config_path, dry_run):
 
 
 # --------------------------------------------------------------------------- #
+#  知识库指针:双保险(env 变量 + AGENTS.md 声明)
+# --------------------------------------------------------------------------- #
+KB_ROOT_ENV = "DINGTALK_KB_ROOT"
+KB_ENTRY_ENV = "DINGTALK_KB_ENTRY"
+
+
+def set_kb_env(cfg):
+    """双保险之一:把知识库指针写进 agent 的自定义环境变量,保证 Agent 一定读得到自己的
+    知识库根节点(另一保险是 AGENTS.md 里的声明,由 qc 检查)。env set 是整体替换,先 get 再合并。"""
+    mult = cfg.get("multica") or {}
+    agent_id = mult.get("agent_id")
+    root = cfg["dingtalk"]["source_node"]
+    entry = cfg["dingtalk"]["entry"]
+    cur, _ = multica(["agent", "env", "get", agent_id])
+    # env get 回的是 {"agent_id":..,"custom_env":{...}};真正的 map 在 custom_env 里,别读错层。
+    ce = cur.get("custom_env") if isinstance(cur, dict) else None
+    env = dict(ce) if isinstance(ce, dict) else {}
+    env[KB_ROOT_ENV] = root
+    env[KB_ENTRY_ENV] = entry
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", delete=False) as f:
+            json.dump(env, f, ensure_ascii=False)
+            tmp = f.name
+        out, rc = multica(["agent", "env", "set", agent_id, "--custom-env-file", tmp])
+        ok = rc == 0 and not (isinstance(out, dict) and out.get("_raw"))
+        print(f"  知识库环境变量 {KB_ROOT_ENV}={root} / {KB_ENTRY_ENV}={entry} → agent: "
+              f"{'✓' if ok else '✗ (需 workspace owner/admin 权限)'}")
+        return ok
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+# --------------------------------------------------------------------------- #
+#  写回(push-dingtalk):Multica → 钉钉源文档(保真写回)
+# --------------------------------------------------------------------------- #
+def push_dingtalk(cfg, work_dir, config_path, dry_run):
+    """把 Multica 上的最新定义**保真**写回钉钉源文档(反方向)。
+    用途:有人在 Multica 里改了技能/instructions,想让钉钉这份「唯一持久层」跟上。
+    只写有 rel→node 映射的文档(先 pull/sync 建映射);Multica 新增、钉钉侧还没有对应
+    节点的,只提示不自动建(避免乱造目录树)。写入走保真三件套:钉钉原生解析器渲 JSONML
+    + 乐观锁(revision)+ 回读校验;检测到钉钉侧并发改动则拒绝覆盖。"""
+    mult = cfg.get("multica") or {}
+    agent_id = mult.get("agent_id")
+    if not agent_id:
+        raise ConfigError("multica.agent_id 未设置。")
+    state = _load_state(config_path)
+    dt = state.get("dingtalk") or {}
+    node_map = dt.get("nodes") or {}
+    entry_node = dt.get("entry_node")
+    if not node_map:
+        raise ConfigError("没有 rel→钉钉节点 映射。先跑一次 `pull` 或 `sync` 建立映射,再往钉钉写回。")
+
+    prefix = mult.get("skill_name_prefix", "")
+    entry = cfg["dingtalk"]["entry"]
+
+    # 收集 (label, node_id, Multica内容)
+    targets, orphans = [], []
+    agent_out, _ = multica(["agent", "get", agent_id])
+    instr = _dig(agent_out, "instructions") or ""
+    if entry_node and instr:
+        targets.append((entry, entry_node, instr))
+    elif instr and not entry_node:
+        orphans.append(entry)
+    for sd in _skill_dirs(work_dir):
+        name, _ = _skill_identity(sd, work_dir, prefix)
+        sid, _ = _resolve_skill_id(name, cfg, state)
+        if not sid:
+            continue
+        so, _ = multica(["skill", "get", sid])
+        rel_skill = (sd / "SKILL.md").relative_to(work_dir).as_posix()
+        content = _dig(so, "content") or ""
+        if content:
+            if node_map.get(rel_skill):
+                targets.append((rel_skill, node_map[rel_skill], content))
+            else:
+                orphans.append(rel_skill)
+        remote_files = {f.get("path"): f.get("content", "")
+                        for f in (_dig(so, "files") or []) if isinstance(f, dict)}
+        for refrel, refcontent in remote_files.items():
+            full = sd.relative_to(work_dir).as_posix() + "/" + refrel
+            if node_map.get(full):
+                targets.append((full, node_map[full], refcontent or ""))
+            else:
+                orphans.append(full)
+
+    print(f"[push-dingtalk] Multica agent {agent_id} → 钉钉源文档(根 {dt.get('root')})"
+          + (" —— 干跑(不写)" if dry_run else ""))
+
+    # 逐个:读钉钉现状 → 容忍对比 → 有真漂移才排队写
+    writes = []
+    for label, node, content in targets:
+        remote, _rev, err = _read_dingtalk_doc(node)
+        if err:
+            print(f"  {'· ' if dry_run else '→ '}{label}: 预读失败 ✗ ({err})")
+            continue
+        match = dingtalk_matches_source(remote, content)
+        if match is not False:
+            print(f"  {'· ' if dry_run else '→ '}{label}: 已一致"
+                  + ("(表现层)" if match == "render" else "") + " —— 免写")
+        else:
+            print(f"  {'· ' if dry_run else '→ '}{label}: 有漂移 → 待写回")
+            writes.append((label, node, content, remote))
+    if orphans:
+        print(f"  ⚠️ Multica 有、钉钉无对应节点(不自动建,需先在钉钉建好再 pull): {sorted(set(orphans))}")
+
+    if dry_run:
+        print("  (加 --yes 才会真正写回钉钉)")
+        return 0
+    if not writes:
+        print("[push-dingtalk] 钉钉侧已全部一致,无需写回")
+        return 0
+
+    fail = 0
+    for label, node, content, remote in writes:
+        status, msg = _write_dingtalk_node(node, content, remote)
+        ok = status in ("written", "already")
+        print(f"  {label}: {'✓ ' if ok else '✗ '}{status} ({msg})")
+        fail += not ok
+    print(f"[push-dingtalk] 完成,失败 {fail} 项")
+    return fail
+
+
+# --------------------------------------------------------------------------- #
 #  校验(verify):Multica 现状 vs 本地定义
 # --------------------------------------------------------------------------- #
 def verify(cfg, work_dir, config_path):
@@ -657,14 +1006,29 @@ def quality_check(cfg, work_dir, config_path):
     mounted_ids = {m.get("id") for m in mounted if isinstance(m, dict)}
     mounted_names = {m.get("name") for m in mounted if isinstance(m, dict)}
 
-    checks = [("instructions 非空", len(instructions.strip()) > 0, f"{len(instructions)} 字")]
+    # checks: (label, ok, detail, hard)。hard=True 才计入失败;hard=False 只是提示。
+    checks = [("instructions 非空", len(instructions.strip()) > 0, f"{len(instructions)} 字", True)]
 
     # 基础技能(dws)必须挂上,否则 Agent 调不动钉钉
     for bn in base_names:
         bid = _resolve_by_name(bn)
         ok = (bid in mounted_ids) or (bn in mounted_names)
         checks.append((f"基础技能 {bn} 已挂载", ok,
-                       "" if ok else "缺失 → 该 Agent 无法调用钉钉,会出问题"))
+                       "" if ok else "缺失 → 该 Agent 无法调用钉钉,会出问题", True))
+
+    # 知识库指针「双保险」:① 环境变量指向知识库根;② AGENTS.md 里声明了这个根节点。
+    # 两处各报一行(软提示),硬性要求是「至少其一可达」——否则 Agent 找不到自己的知识库。
+    root = cfg["dingtalk"]["source_node"]
+    env_out, _ = multica(["agent", "env", "get", agent_id])
+    _ce = env_out.get("custom_env") if isinstance(env_out, dict) else None
+    env_ok = isinstance(_ce, dict) and _ce.get(KB_ROOT_ENV) == root
+    doc_ok = root in instructions
+    checks.append((f"环境变量 {KB_ROOT_ENV} 指向知识库", env_ok,
+                   "" if env_ok else "未设(sync --yes 会自动写;写不进多因非 workspace owner/admin)", False))
+    checks.append(("AGENTS.md 声明了知识库根节点", doc_ok,
+                   "" if doc_ok else f"入口文档里没有根节点 {root};建议加一行「知识库根: {root}」", False))
+    checks.append(("知识库指针可达(env 或 AGENTS.md 至少其一)", env_ok or doc_ok,
+                   "" if (env_ok or doc_ok) else "两处都没有 → Agent 找不到自己的知识库", True))
 
     # 每个同步技能:name / description / content 非空,且已挂载
     skill_dirs = _skill_dirs(work_dir)
@@ -686,17 +1050,18 @@ def quality_check(cfg, work_dir, config_path):
         if sid not in mounted_ids and name not in mounted_names:
             not_mounted.append(name)
     n = len(skill_dirs)
-    checks.append((f"{n} 个技能 name 非空", not no_name, "，".join(no_name)))
-    checks.append((f"{n} 个技能 description 非空", not no_desc, "，".join(no_desc)))
-    checks.append((f"{n} 个技能 content 非空", not empty_content, "，".join(empty_content)))
-    checks.append((f"{n} 个技能已挂载到 agent", not not_mounted, "，".join(not_mounted)))
+    checks.append((f"{n} 个技能 name 非空", not no_name, "，".join(no_name), True))
+    checks.append((f"{n} 个技能 description 非空", not no_desc, "，".join(no_desc), True))
+    checks.append((f"{n} 个技能 content 非空", not empty_content, "，".join(empty_content), True))
+    checks.append((f"{n} 个技能已挂载到 agent", not not_mounted, "，".join(not_mounted), True))
 
     bad = 0
     print(f"[qc] 质检 agent {agent_id}")
-    for label, ok, detail in checks:
+    for label, ok, detail, hard in checks:
         tail = f"  ({detail})" if detail else ""
-        print(f"  {label}: {'✓' if ok else '✗'}{tail}")
-        bad += not ok
+        mark = "✓" if ok else ("✗" if hard else "⚠")
+        print(f"  {label}: {mark}{tail}")
+        bad += (not ok) and hard
     print(f"[qc] {'质检通过,Agent 完备' if not bad else f'⚠️ {bad} 项待修'}")
     return bad
 
@@ -705,14 +1070,15 @@ def quality_check(cfg, work_dir, config_path):
 #  main
 # --------------------------------------------------------------------------- #
 def main():
-    ap = argparse.ArgumentParser(description="钉钉文档节点 → Multica agent 主动同步")
+    ap = argparse.ArgumentParser(description="钉钉文档知识库 ⇄ Multica agent 双向同步")
     ap.add_argument("command", nargs="?", default="sync",
-                    choices=["pull", "sync", "verify", "qc"],
-                    help="pull=只物化; sync=物化+推送(默认干跑,--yes 才写); "
+                    choices=["pull", "sync", "push-dingtalk", "verify", "qc"],
+                    help="pull=只从钉钉物化; sync=钉钉→Multica(默认干跑,--yes 才写); "
+                         "push-dingtalk=Multica→钉钉保真写回(默认干跑,--yes 才写); "
                          "verify=回读比对; qc=完成质检")
     ap.add_argument("--config", default="agents.md", help="同步配置文件(默认 ./agents.md)")
     ap.add_argument("--work-dir", default="./.agent-workspace", help="定义物化目录")
-    ap.add_argument("--yes", action="store_true", help="sync 时真正写入 Multica")
+    ap.add_argument("--yes", action="store_true", help="sync / push-dingtalk 时真正写入")
     ap.add_argument("--force", action="store_true", help="忽略已物化目录,清空重拉")
     args = ap.parse_args()
 
@@ -722,11 +1088,19 @@ def main():
             sys.exit(1 if verify(cfg, args.work_dir, args.config) else 0)
         if args.command == "qc":
             sys.exit(1 if quality_check(cfg, args.work_dir, args.config) else 0)
-        pull(cfg, args.work_dir, args.force or args.command == "sync")
+        if args.command == "push-dingtalk":
+            # 反方向:Multica → 钉钉。先 pull 刷新工作区结构与 rel→node 映射,再保真写回。
+            pull(cfg, args.work_dir, True, args.config)
+            sys.exit(1 if push_dingtalk(cfg, args.work_dir, args.config,
+                                        dry_run=not args.yes) else 0)
+        # 正方向:钉钉 → Multica
+        pull(cfg, args.work_dir, args.force or args.command == "sync", args.config)
         if args.command == "pull":
             return
         push(cfg, args.work_dir, args.config, dry_run=not args.yes)
         if args.yes:
+            # 双保险之一:把知识库指针写进 agent 环境变量(另一保险=AGENTS.md 声明,由 qc 查)
+            set_kb_env(cfg)
             bad_v = verify(cfg, args.work_dir, args.config)
             bad_q = quality_check(cfg, args.work_dir, args.config)
             sys.exit(1 if (bad_v or bad_q) else 0)

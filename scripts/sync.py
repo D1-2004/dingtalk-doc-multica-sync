@@ -135,6 +135,9 @@ def load_config(path):
     mult = cfg.setdefault("multica", {})
     sync = cfg.setdefault("sync", {})
     dingtalk.setdefault("entry", "AGENTS.md")
+    # 基础技能:钉钉原生 Agent 全靠 dws CLI 跟钉钉说话,没有 dws 技能整套都跑不动。
+    # 默认给每个同步出来的 agent 挂上 dws;要加别的公共底座技能就往这个列表里加名字。
+    mult.setdefault("base_skills", ["dws"])
     sync.setdefault("include", ["AGENTS.md", "skills/**"])
     sync.setdefault("exclude", ["memories/**", "storage/**", "artifacts/**", "tools/**"])
 
@@ -397,13 +400,60 @@ def _skill_dirs(work_dir):
     return out
 
 
+def _derive_description(md, max_len=200):
+    """没有 frontmatter description 时,从正文提炼一句话描述。
+    钉钉侧 SKILL.md 一般是 `# SKILL: <名>` + 一段说明,没有 YAML 头。取第一段实义散文
+    (跳过标题/子标题/引用/表格/代码块/列表符/强调符),压成一行、截断,作为标准描述字段。"""
+    body = re.sub(r"\A---\r?\n.*?\r?\n---\r?\n?", "", md, flags=re.DOTALL)
+    para, started, in_fence = [], False, False
+    for raw in body.split("\n"):
+        line = raw.strip()
+        if line.startswith("```") or line.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if not line:
+            if started:
+                break            # 第一段结束
+            continue
+        if line.startswith(("#", ">", "|", "<!--", "![", "---", "===")):
+            continue
+        text = re.sub(r"^[\-\*\d\.\)、\s]+", "", line)   # 去列表/序号符
+        text = re.sub(r"[*`_#>]", "", text).strip()      # 去强调/标记符
+        if not text:
+            continue
+        para.append(text)
+        started = True
+    desc = re.sub(r"\s+", " ", " ".join(para)).strip()
+    if len(desc) > max_len:
+        desc = desc[:max_len].rstrip("，,。.、 ") + "…"
+    return desc
+
+
+def _clean_skill_name(name):
+    """标准化技能名:剥掉 `SKILL:` / `SKILL：` 前缀,防止把「SKILL: 校招生成长日志」当成名字。"""
+    return re.sub(r"^\s*SKILL\s*[:：]\s*", "", name or "").strip()
+
+
 def _skill_identity(skill_dir, work_dir, prefix):
     md = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
     fm = _frontmatter(md)
-    name = fm.get("name") or skill_dir.name
+    name = _clean_skill_name(fm.get("name") or skill_dir.name)
     if prefix:
         name = f"{prefix}{name}"
-    return name, fm.get("description", "")
+    desc = fm.get("description") or _derive_description(md) or name
+    return name, desc
+
+
+def _resolve_by_name(name):
+    """按名字在 workspace 技能库里找一个已存在的技能(用于 dws 等基础技能)。"""
+    listing, _ = multica(["skill", "list"])
+    items = listing if isinstance(listing, list) else _dig(listing, "skills") or []
+    for it in items if isinstance(items, list) else []:
+        if isinstance(it, dict) and it.get("name") == name:
+            return it.get("id")
+    return None
 
 
 def _state_path(config_path):
@@ -450,6 +500,7 @@ def push(cfg, work_dir, config_path, dry_run):
             "把返回的 id 写进 agents.md 的 multica.agent_id。"
         )
     prefix = mult.get("skill_name_prefix", "")
+    base_names = mult.get("base_skills", ["dws"])
     state = _load_state(config_path)
 
     entry = cfg["dingtalk"]["entry"]
@@ -459,17 +510,23 @@ def push(cfg, work_dir, config_path, dry_run):
     plan = []
     plan.append(("agent.instructions", f"← {entry} ({len(entry_content)} 字)"))
     for sd in skill_dirs:
-        name, _ = _skill_identity(sd, work_dir, prefix)
+        name, desc = _skill_identity(sd, work_dir, prefix)
         sid, origin = _resolve_skill_id(name, cfg, state)
         refs = [p for p in sorted(sd.rglob("*.md")) if p.name != "SKILL.md"]
-        plan.append((f"skill:{name}", f"{'update' if sid else 'create'}({origin}) + {len(refs)} 附件"))
+        plan.append((f"skill:{name}",
+                     f"{'update' if sid else 'create'}({origin}) + {len(refs)} 附件 "
+                     f"| desc: {desc[:32]}…" if len(desc) > 32 else
+                     f"{'update' if sid else 'create'}({origin}) + {len(refs)} 附件 | desc: {desc}"))
+    for bn in base_names:
+        bid = _resolve_by_name(bn)
+        plan.append((f"base-skill:{bn}", "挂载" if bid else "⚠️ workspace 未找到,无法挂载"))
 
     print(f"[push] 目标 Multica agent {agent_id}" + (" —— 干跑(不写入)" if dry_run else ""))
     for label, detail in plan:
         print(f"  {'· ' if dry_run else '→ '}{label}: {detail}")
     if dry_run:
         print("  (加 --yes 才会真正写入 Multica)")
-        return state
+        return {"synced": [], "base": []}
 
     fail = 0
     # 1) 入口文档 → agent instructions
@@ -477,19 +534,20 @@ def push(cfg, work_dir, config_path, dry_run):
     print(f"  agent.instructions ← {entry}: {'✓' if rc == 0 else '✗'}")
     fail += rc != 0
 
-    # 2) 每个 skills/<name>/ → 一个 skill(+ 附件),并挂载
-    mounted_ids = []
+    # 2) 每个 skills/<name>/ → 一个 skill(+ 附件),并挂载。
+    #    create 与 update 都写全 name+description —— 标准 SKILL 同步范式:名字与描述都得对,
+    #    重跑也把老技能的空描述补正过来(只更 content 会让描述永远空着)。
+    mounted_ids, synced = [], []
     for sd in skill_dirs:
         name, desc = _skill_identity(sd, work_dir, prefix)
         skill_md = str(sd / "SKILL.md")
         sid, _ = _resolve_skill_id(name, cfg, state)
         if sid:
-            _, rc = multica(["skill", "update", sid, "--content-file", skill_md])
+            _, rc = multica(["skill", "update", sid, "--name", name,
+                             "--description", desc, "--content-file", skill_md])
         else:
-            out, rc = multica(
-                ["skill", "create", "--name", name, "--description", desc,
-                 "--content-file", skill_md]
-            )
+            out, rc = multica(["skill", "create", "--name", name,
+                               "--description", desc, "--content-file", skill_md])
             sid = _dig(out, "id")
         if not sid or rc != 0:
             print(f"  skill:{name}: 创建/更新失败 ✗")
@@ -505,20 +563,32 @@ def push(cfg, work_dir, config_path, dry_run):
                              "--content-file", str(ref)])
             fail += rc != 0
         mounted_ids.append(sid)
-        print(f"  skill:{name} ({sid}): ✓")
+        synced.append((name, sid))
+        print(f"  skill:{name} ({sid}): ✓  desc={desc[:40]}")
 
-    # 3) 挂载(不替换已有挂载)
+    # 3) 基础技能:dws 是钉钉原生 Agent 的命根子,默认挂上。缺了 QC 会报。
+    base = []
+    for bn in base_names:
+        bid = _resolve_by_name(bn)
+        if bid:
+            base.append((bn, bid))
+            mounted_ids.append(bid)
+        else:
+            print(f"  ⚠️ base skill {bn}: workspace 未找到,无法挂载(QC 会标记为缺失)")
+
+    # 4) 挂载(add 不替换已有挂载,重复挂同一 id 不会产生副本)
     if mounted_ids:
         _, rc = multica(["agent", "skills", "add", agent_id,
                          "--skill-ids", ",".join(mounted_ids)])
-        print(f"  mount {len(mounted_ids)} skills → agent: {'✓' if rc == 0 else '✗'}")
+        print(f"  mount {len(synced)} 同步技能 + {len(base)} 基础技能 → agent: "
+              f"{'✓' if rc == 0 else '✗'}")
         fail += rc != 0
 
     _save_state(config_path, state)
     print(f"[push] 完成,失败 {fail} 项")
     if fail:
         raise SystemExit(1)
-    return state
+    return {"synced": synced, "base": base}
 
 
 # --------------------------------------------------------------------------- #
@@ -568,13 +638,78 @@ def verify(cfg, work_dir, config_path):
 
 
 # --------------------------------------------------------------------------- #
+#  质检(qc):完成阶段的合规/完备性检查
+# --------------------------------------------------------------------------- #
+def quality_check(cfg, work_dir, config_path):
+    """同步完成后的质检:这个 agent 是不是一个合规、完备的智能体。
+    只读,既在 sync --yes 末尾自动跑,也能单独 `qc` 随时复检。"""
+    mult = cfg.get("multica") or {}
+    agent_id = mult.get("agent_id")
+    if not agent_id:
+        raise ConfigError("multica.agent_id 未设置,无从质检。")
+    prefix = mult.get("skill_name_prefix", "")
+    base_names = mult.get("base_skills", ["dws"])
+    state = _load_state(config_path)
+
+    agent_out, _ = multica(["agent", "get", agent_id])
+    instructions = _dig(agent_out, "instructions") or ""
+    mounted = _dig(agent_out, "skills") or []
+    mounted_ids = {m.get("id") for m in mounted if isinstance(m, dict)}
+    mounted_names = {m.get("name") for m in mounted if isinstance(m, dict)}
+
+    checks = [("instructions 非空", len(instructions.strip()) > 0, f"{len(instructions)} 字")]
+
+    # 基础技能(dws)必须挂上,否则 Agent 调不动钉钉
+    for bn in base_names:
+        bid = _resolve_by_name(bn)
+        ok = (bid in mounted_ids) or (bn in mounted_names)
+        checks.append((f"基础技能 {bn} 已挂载", ok,
+                       "" if ok else "缺失 → 该 Agent 无法调用钉钉,会出问题"))
+
+    # 每个同步技能:name / description / content 非空,且已挂载
+    skill_dirs = _skill_dirs(work_dir)
+    no_name, no_desc, empty_content, not_mounted = [], [], [], []
+    for sd in skill_dirs:
+        name, _ = _skill_identity(sd, work_dir, prefix)
+        sid, _ = _resolve_skill_id(name, cfg, state)
+        if not sid:
+            no_name.append(name)
+            not_mounted.append(name)
+            continue
+        so, _ = multica(["skill", "get", sid])
+        if not (_dig(so, "name") or "").strip():
+            no_name.append(name)
+        if not (_dig(so, "description") or "").strip():
+            no_desc.append(name)
+        if not (_dig(so, "content") or "").strip():
+            empty_content.append(name)
+        if sid not in mounted_ids and name not in mounted_names:
+            not_mounted.append(name)
+    n = len(skill_dirs)
+    checks.append((f"{n} 个技能 name 非空", not no_name, "，".join(no_name)))
+    checks.append((f"{n} 个技能 description 非空", not no_desc, "，".join(no_desc)))
+    checks.append((f"{n} 个技能 content 非空", not empty_content, "，".join(empty_content)))
+    checks.append((f"{n} 个技能已挂载到 agent", not not_mounted, "，".join(not_mounted)))
+
+    bad = 0
+    print(f"[qc] 质检 agent {agent_id}")
+    for label, ok, detail in checks:
+        tail = f"  ({detail})" if detail else ""
+        print(f"  {label}: {'✓' if ok else '✗'}{tail}")
+        bad += not ok
+    print(f"[qc] {'质检通过,Agent 完备' if not bad else f'⚠️ {bad} 项待修'}")
+    return bad
+
+
+# --------------------------------------------------------------------------- #
 #  main
 # --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser(description="钉钉文档节点 → Multica agent 主动同步")
     ap.add_argument("command", nargs="?", default="sync",
-                    choices=["pull", "sync", "verify"],
-                    help="pull=只物化; sync=物化+推送(默认干跑,--yes 才写); verify=回读比对")
+                    choices=["pull", "sync", "verify", "qc"],
+                    help="pull=只物化; sync=物化+推送(默认干跑,--yes 才写); "
+                         "verify=回读比对; qc=完成质检")
     ap.add_argument("--config", default="agents.md", help="同步配置文件(默认 ./agents.md)")
     ap.add_argument("--work-dir", default="./.agent-workspace", help="定义物化目录")
     ap.add_argument("--yes", action="store_true", help="sync 时真正写入 Multica")
@@ -585,12 +720,16 @@ def main():
         cfg = load_config(args.config)
         if args.command == "verify":
             sys.exit(1 if verify(cfg, args.work_dir, args.config) else 0)
+        if args.command == "qc":
+            sys.exit(1 if quality_check(cfg, args.work_dir, args.config) else 0)
         pull(cfg, args.work_dir, args.force or args.command == "sync")
         if args.command == "pull":
             return
-        state = push(cfg, args.work_dir, args.config, dry_run=not args.yes)
+        push(cfg, args.work_dir, args.config, dry_run=not args.yes)
         if args.yes:
-            verify(cfg, args.work_dir, args.config)
+            bad_v = verify(cfg, args.work_dir, args.config)
+            bad_q = quality_check(cfg, args.work_dir, args.config)
+            sys.exit(1 if (bad_v or bad_q) else 0)
     except ConfigError as exc:
         print(f"配置/前置错误: {exc}", file=sys.stderr)
         sys.exit(2)

@@ -35,7 +35,8 @@
   },
   "multica": {
     "agent_id": "PUT-MULTICA-AGENT-ID-HERE",
-    "skill_name_prefix": ""
+    "skill_name_prefix": "",
+    "base_skills": ["dws"]
   },
   "sync": {
     "include": ["AGENTS.md", "skills/**"],
@@ -52,6 +53,7 @@
 | `dingtalk.entry` | 入口文档名(根节点下作为 agent instructions 的那份)。默认 `AGENTS.md`。 |
 | `multica.agent_id` | 目标 Multica agent 的 UUID。没有就先 `multica agent create --name "…" --runtime-id <runtime>` 建一个,把返回的 id 填进来。 |
 | `multica.skill_name_prefix` | 可选。给同步出的 skill 名统一加前缀(如 `"fde/"`),避免同一 workspace 里多个 Agent 的同名 skill 撞车。默认空。 |
+| `multica.base_skills` | 默认给 agent 挂上的**基础技能名**列表。默认 `["dws"]` —— 钉钉原生 Agent 全靠 dws CLI 跟钉钉说话,**没有 dws 技能整套都跑不动**,所以默认必挂。要加别的公共底座技能就往列表里加名字;这些技能须已存在于 workspace 技能库(按名解析),缺了质检会标红。 |
 | `sync.include` | 只同步匹配这些 glob 的定义文档。默认 = 入口文档 + 整棵 `skills/`。 |
 | `sync.exclude` | 从 include 里再挖掉的部分。默认排除全部动态数据。 |
 
@@ -74,9 +76,15 @@ python3 scripts/sync.py pull
 # 物化 + 打印将写入 Multica 的计划(默认干跑,不写)
 python3 scripts/sync.py sync
 
-# 确认无误后,真正写入 Multica 并回读校验
+# 确认无误后,真正写入 Multica、回读校验、并做完成质检
 python3 scripts/sync.py sync --yes
+
+# 随时单独复检这个 agent 是否完备(instructions/描述/dws/挂载)
+python3 scripts/sync.py qc
 ```
+
+`sync --yes` 末尾会自动跑一遍**质检(qc)**:instructions 非空、`dws` 基础技能已挂载、
+每个技能 name/description/content 非空且已挂载。有一项不过就报「N 项待修」并非零退出。
 
 本工具**不注册任何定时/触发自动化**。要更新,就在钉钉里改文档,然后再手动跑一次
 `sync --yes`。这是刻意的:同步是一次可审阅的发布动作,不是后台悄悄发生的事。

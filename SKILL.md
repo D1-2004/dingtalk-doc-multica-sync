@@ -36,11 +36,14 @@ python3 scripts/sync.py pull
 # 2. 物化 + 打印将写入 Multica 的计划(默认干跑,不写)
 python3 scripts/sync.py sync
 
-# 3. 确认后真正写入,并回读校验
+# 3. 确认后真正写入,回读校验 + 完成质检
 python3 scripts/sync.py sync --yes
+
+# 随时单独复检 agent 是否完备
+python3 scripts/sync.py qc
 ```
 
-`pull` 把入口文档与 `skills/` 拉到 `./.agent-workspace`;`push` 把入口文档写成 agent 的 **instructions**、每个 `skills/<name>/` 建/更新为一个 skill 并挂载;`verify` 用 `agent get` / `skill get` 回读逐一比对。
+`pull` 把入口文档与 `skills/` 拉到 `./.agent-workspace`;`push` 把入口文档写成 agent 的 **instructions**、每个 `skills/<name>/` 建/更新为一个 skill(name+description 写全)并连同 `dws` 基础技能挂载;`verify` 回读逐一比对;`qc` 检查 agent 是否完备。
 
 ## 边界(第一阶段,主动触发)
 
@@ -48,14 +51,18 @@ python3 scripts/sync.py sync --yes
 |---|---|---|
 | 入口文档 `AGENTS.md` | ✅ | → Multica agent instructions |
 | `skills/<name>/SKILL.md` + `references/*.md` | ✅ | → 一个 Multica skill(+ 附件),挂载到 agent |
+| `dws` 基础技能 | ✅ | 默认挂载(`base_skills`);钉钉原生 Agent 靠 dws 说话,缺了跑不动 |
 | `memories/` `storage/` `artifacts/` | ❌ | 动态数据/运行状态,不是定义。第二阶段由 DWS 按场景运行时拉取 |
 | 二进制/脚本资产(`.py` `.xlsx` …) | ❌ | 非定义;钉钉侧是文件节点,本阶段跳过 |
 
-同步范围由 `agents.md` 的 `sync.include` / `sync.exclude` 决定,默认即上表。
+同步范围由 `agents.md` 的 `sync.include` / `sync.exclude` 决定;基础技能由 `base_skills` 决定,默认即上表。
 
 ## 关键约束(沿用底座实测教训)
 
 - **主动发起**:本 skill 不创建任何定时/触发自动化。要更新就改文档再手动 `sync --yes`。
+- **dws 默认必挂**:`base_skills` 默认 `["dws"]`,钉钉原生 Agent 全靠它跟钉钉说话;缺了 `qc` 报错。
+- **技能元数据不留空**:name 剥掉 `SKILL:` 前缀;description 无 frontmatter 时从正文首段提炼;create/update 都写全,老技能空描述也补正。
+- **完成有质检**:`sync --yes` 末尾自动 `qc`(instructions/dws/每技能 name+description+content+挂载),半成品当场拦。
 - **接口 success ≠ 内容真写入**:每次写完都 `skill get` / `agent get` 回读比对才算成功(`verify` 已内建)。
 - **坏响应不当空目录**:钉钉 `doc list` 的坏 envelope 会被判为「列表失败」而非「空」,拒绝据此漏拉。
 - **写前干跑**:`sync` 默认不写,先打印计划;`--yes` 才落 Multica。

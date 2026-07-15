@@ -30,6 +30,7 @@
 |---|---|---|
 | 入口 `AGENTS.md` | ✅ | → agent instructions(身份/行为准则/路由) |
 | `skills/<name>/SKILL.md` + `references/*.md` | ✅ | → 一个 Multica skill(+ 附件),挂载到 agent |
+| `dws` 基础技能 | ✅ | 默认挂载(`base_skills`)—— 钉钉原生 Agent 全靠 dws 说话,缺了跑不动 |
 | `memories/` `storage/` `artifacts/` | ❌ | 上下文与运行状态,不是定义 |
 | 二进制 / 脚本资产 | ❌ | 非定义;钉钉侧是文件节点,本阶段跳过 |
 
@@ -76,11 +77,12 @@ python3 scripts/sync.py sync --yes
 
 ## 它怎么工作
 
-`scripts/sync.py` 三段:
+`scripts/sync.py` 四段:
 
 1. **pull** — 从 `dingtalk.source_node` 逐层并发 `dws doc list` 递归发现文件夹树,`dws doc read` 拉取入口文档与 `skills/` 下的 adoc 文档,反解钉钉 adoc 转义后物化到 `./.agent-workspace`。动态目录与二进制被显式跳过并列出。
-2. **push** — 入口文档 → `multica agent update --instructions`;每个 `skills/<name>/` → `multica skill create/update`(+ `skill files upsert` 附件)→ `multica agent skills add` 挂载。name→id 存进 `.sync-state.json`,重跑是更新而非重复创建。
+2. **push** — 入口文档 → `multica agent update --instructions`;每个 `skills/<name>/` → `multica skill create/update`(**name + description 都写全**:无 frontmatter 时从正文提炼一句话描述,符合标准 SKILL 范式;create 与 update 都设,重跑也把老技能的空描述补正)+ `skill files upsert` 附件 → 连同 `base_skills`(默认 `dws`)`multica agent skills add` 挂载。name→id 存进 `.sync-state.json`,重跑是更新而非重复创建。
 3. **verify** — `multica agent get` / `multica skill get` 回读,与本地物化逐一比对(接口 success 不算数,内容一致才算)。
+4. **qc** — 完成质检:instructions 非空、`dws` 已挂载、每个技能 name/description/content 非空且已挂载。`sync --yes` 末尾自动跑,也能 `python3 scripts/sync.py qc` 单独复检。任一不过则非零退出。
 
 ## 怎么用:装进 Multica,形成闭环
 
@@ -114,6 +116,9 @@ multica agent update <agent-id> --instructions "$(cat .agent-workspace/AGENTS.md
 - **回读定成败。** dws/multica 的接口 `success` 不等于内容真写入;一律回读比对。
 - **坏响应不当空目录。** 钉钉 `doc list` 的坏 envelope 被判「列表失败」,拒绝据此漏拉整棵子树。
 - **同名 skill 隔离。** 同一 workspace 多个 Agent 若有同名 skill,用 `multica.skill_name_prefix` 加前缀避免撞车。
+- **dws 默认必挂。** 钉钉原生 Agent 全靠 dws CLI 跟钉钉说话;`base_skills` 默认 `["dws"]`,缺了质检报错。
+- **技能元数据不留空。** 名字剥掉 `SKILL:` 前缀,描述无 frontmatter 时从正文首段提炼;create/update 都写,老技能的空描述也补正。
+- **完成有质检。** `sync --yes` 末尾自动 `qc`,把「看着同步完了但其实缺描述/没挂 dws/没挂上」这类半成品当场拦下。
 
 ## License
 

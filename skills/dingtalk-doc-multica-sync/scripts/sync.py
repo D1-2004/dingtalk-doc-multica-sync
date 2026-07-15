@@ -66,11 +66,15 @@ MULTICA = _find_bin("multica")
 
 def _run(binary, args, tail, timeout):
     # errors="replace":dws/multica 输出偶尔在多字节字符中间截断,strict 解码会直接抛异常打断整条链。
-    proc = subprocess.run(
-        [binary] + args + tail,
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=timeout,
-    )
+    try:
+        proc = subprocess.run(
+            [binary] + args + tail,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        # 单节点超时不该以未捕获异常炸掉整条同步:返回哨兵,让退避/truncated 标记接管。
+        return {"error": {"message": "timeout", "kind": "timeout"}}, -1
     raw = (proc.stdout or "").strip()
     if not raw or not raw.lstrip().startswith(("{", "[")):
         raw = (proc.stderr or "").strip() or raw
@@ -86,8 +90,24 @@ def _run(binary, args, tail, timeout):
         return {"_raw": raw[:400]}, proc.returncode
 
 
+_RATE_LIMIT_RE = re.compile(r"rate.?limit|限流", re.I)
+
+
 def dws(args, timeout=90):
-    return _run(DWS, args, ["--format", "json"], timeout)
+    # 钉钉对 doc read 有函数级限流:批量反向同步一口气读几十个节点必被 `函数触发限流` 挡。
+    # 命中限流就退避重试,别把一次限流当成「读取失败」误报漂移。限流文本可能落在 error 也可能落在
+    # _raw 里,所以扫整个响应 blob,不只看 error 键。
+    parsed, rc = _run(DWS, args, ["--format", "json"], timeout)
+    for attempt in range(3):
+        blob = json.dumps(parsed, ensure_ascii=False) if isinstance(parsed, dict) else ""
+        if not _RATE_LIMIT_RE.search(blob):
+            break
+        time.sleep(1.5 * (attempt + 1))
+        parsed, rc = _run(DWS, args, ["--format", "json"], timeout)
+    # dws 的响应恒为对象:None / JSON 数组一律包成 {"_raw":...},免得下游 `out.get(...)` 崩。
+    if not isinstance(parsed, dict):
+        parsed = {"_raw": str(parsed)[:400]}
+    return parsed, rc
 
 
 def multica(args, timeout=90):
@@ -180,7 +200,7 @@ def _normalize_source_markdown(value):
 
 def _unescape_adoc(value):
     """反解一层 adoc 转义(\\_ \\* \\| ...),保留源文件里真正的反斜杠。"""
-    sentinel = "@@DWS_BACKSLASH@@"
+    sentinel = chr(0) + "DWS_BS" + chr(0)   # 空字节哨兵:正文不可能出现,零碰撞
     value = (value or "").replace("\\\\", sentinel)
     value = re.sub(r"\\([+\[\]_><{}().$|])", r"\1", value)
     return value.replace(sentinel, "\\")
@@ -209,9 +229,13 @@ def _render_equivalent(value):
     分隔线与空白 —— 把「钉钉重排版」这类表现层差异和「内容真被改」区分开。"""
     v = re.sub(r"[（(]?\[打开\]\(https://alidocs\.dingtalk\.com/[^)]*\)[)）]?", "", value or "")
     v = re.sub(r"\[([^\]]*)\]\(https://alidocs\.dingtalk\.com/[^)]*\)", r"\1", v)
-    v = re.sub(r"\*{1,3}", "", v)          # 钉钉会重排加粗边界
+    # 钉钉把 _斜体_ 归一成 *斜体*:只归一「非词内」的成对下划线强调,不碰 snake_case / CLI 标识 —
+    # 否则 user_id→userid、run_in_background→runinbackground 这类**真改动**会被误判成等价(假阴,漏写回)。
+    v = re.sub(r"(?<![0-9A-Za-z])_(\S(?:[^_\n]*\S)?)_(?![0-9A-Za-z])", r"*\1*", v)
+    v = re.sub(r"\*{1,3}", "", v)          # 钉钉会重排加粗/斜体边界
     v = re.sub(r"^\s*>\s?", "", v)         # 钉钉会丢引用块的 > 前缀
-    v = re.sub(r"-{2,}", "-", v)           # 表格分隔行 |----| 被重排成 |---|
+    if re.match(r"^[\s|:\-]+$", v):        # 仅表格分隔行才折叠连字符(|----|→|---|),不碰 --flag/代码里的 -
+        v = re.sub(r"-{2,}", "-", v)
     v = re.sub(r"[ \t]+", "", v)
     return v
 
@@ -272,6 +296,14 @@ def _read_dingtalk_doc(node_id):
     return None, None, (out.get("error") or out.get("_raw") or rc)
 
 
+def _read_dingtalk_markdown(node_id):
+    """只读正文 markdown(不取 revision)—— 比对阶段够用,读一次而非两次,减半限流压力。"""
+    out, rc = dws(["doc", "read", "--node", node_id])
+    if rc == 0 and not out.get("error") and "markdown" in out:
+        return out["markdown"], None
+    return None, (out.get("error") or out.get("_raw") or rc)
+
+
 def _read_dingtalk_jsonml(node_id):
     out, rc = dws(["doc", "read", "--node", node_id, "--content-format", "jsonml"])
     if rc == 0 and not out.get("error") and "jsonml" in out:
@@ -284,6 +316,10 @@ def _render_markdown_jsonml(target_node, content):
     在目标同目录建临时文档 → 写 markdown → 回读 JSONML → 删临时文档。
     绕开「裸 markdown 直接写回被重排版失真」。返回 (jsonml, error)。"""
     content = _unratchet(content)
+    if len(content) > 10000:
+        # 钉钉单篇文档硬顶 1 万字符,超了 doc update 直接被拒。快速失败给准确错因,
+        # 省掉 3 轮无效临时文档往返。
+        return None, f"内容 {len(content)} 字超钉钉单档 1 万字符上限,拒写(建议拆节点)"
     info, irc = dws(["doc", "info", "--node", target_node])
     folder_id = _dig(info, "folderId")
     if irc != 0 or not folder_id or info.get("error"):
@@ -302,8 +338,9 @@ def _render_markdown_jsonml(target_node, content):
                 break
             time.sleep(0.8 * (attempt + 1))
             listed, lrc = dws(["doc", "list", "--folder", folder_id])
-            if lrc == 0 and isinstance(listed, dict):
-                scratch = next((it.get("nodeId") for it in (listed.get("nodes") or [])
+            payload = listed.get("data") if isinstance(listed.get("data"), dict) else listed
+            if lrc == 0 and isinstance(payload, dict):
+                scratch = next((it.get("nodeId") for it in (payload.get("nodes") or [])
                                 if it.get("name") == scratch_name), None)
         if not scratch:
             return None, "临时文档创建无返回"
@@ -331,20 +368,19 @@ def _render_markdown_jsonml(target_node, content):
         if scratch:
             d, drc = dws(["doc", "delete", "--node", scratch, "--yes"])
             if drc != 0 or d.get("error") or d.get("success") is False:
-                error = error or f"临时文档清理失败: {scratch}"
-                rendered = None
+                # 清理失败只告警:渲染本身与删临时文档相互独立,不能因删不掉而否决一次成功的写回。
+                # 残留的 dtsync-render-* 会被 discover 过滤,不进 node_map。
+                print(f"  ⚠️ 临时渲染文档未清理,残留(不影响本次写回): {scratch}")
     return rendered, error
 
 
 def dingtalk_write_decision(baseline, latest, expected):
-    """写/免写/冲突:防止盖掉钉钉侧的并发编辑。"""
-    baseline = normalize_dingtalk_markdown(baseline)
-    latest = normalize_dingtalk_markdown(latest)
-    expected = _normalize_source_markdown(expected)
-    if latest == expected:
-        return "already"
-    if latest != baseline:
-        return "conflict"
+    """写/免写/冲突:防止盖掉钉钉侧的并发编辑,且语义已一致(含表现层等价)就不重复写。
+    用容忍钉钉重序列化的对比,避免 `_斜体_`↔`*斜体*` 这类等价差异被判成「要写」而空转 revision。"""
+    if dingtalk_matches_source(latest, expected) is not False:
+        return "already"                 # 已(语义)一致,免写
+    if dingtalk_matches_source(latest, baseline) is False:
+        return "conflict"                # 初读后钉钉侧又被改了,别覆盖
     return "write"
 
 
@@ -511,6 +547,8 @@ def discover(root, include, exclude):
                         skipped_dynamic.append(rel + "/")
                     continue
                 # 文件节点
+                if (child.get("name") or "").startswith("dtsync-render-"):
+                    continue  # 写回时临时渲染文档的清理残留,不是定义,别进 node_map
                 if not _file_included(rel, include, exclude):
                     skipped_dynamic.append(rel)
                     continue
@@ -549,7 +587,7 @@ def pull(cfg, work_dir, force, config_path=None):
     with ThreadPoolExecutor(max_workers=min(POOL, max(1, len(files)))) as ex:
         results = list(ex.map(_fetch, files))
     # 定点重试:失败的逐个再取一次(治瞬时抖动)
-    by_rel = {rel: it for rel, it in ((it[0], it) for it in files)}
+    by_rel = {item[0]: item for item in files}
     for r in results:
         if r.get("error") and "非在线" not in r["error"]:
             time.sleep(0.8)
@@ -594,7 +632,7 @@ def pull(cfg, work_dir, force, config_path=None):
             "entry": entry,
             "entry_node": node_map.get(entry),
             "nodes": node_map,
-            "folders": getattr(discover, "folder_ids", {"": root}),
+            "folders": discover.folder_ids,
         }
         _save_state(config_path, state)
     return {"written": written, "truncated": truncated}
@@ -670,14 +708,32 @@ def _skill_identity(skill_dir, work_dir, prefix):
     return name, desc
 
 
+_SKILL_LIST_CACHE = None
+
+
+def _skill_list():
+    """进程内缓存整份 workspace 技能列表(push/qc 会多次按名查共享基础技能,拉一次即可)。"""
+    global _SKILL_LIST_CACHE
+    if _SKILL_LIST_CACHE is None:
+        listing, _ = multica(["skill", "list"])
+        items = listing if isinstance(listing, list) else _dig(listing, "skills") or []
+        _SKILL_LIST_CACHE = items if isinstance(items, list) else []
+    return _SKILL_LIST_CACHE
+
+
 def _resolve_by_name(name):
-    """按名字在 workspace 技能库里找一个已存在的技能(用于 dws 等基础技能)。"""
-    listing, _ = multica(["skill", "list"])
-    items = listing if isinstance(listing, list) else _dig(listing, "skills") or []
-    for it in items if isinstance(items, list) else []:
+    """按名字在 workspace 技能库里找一个已存在的**共享**技能(仅用于 dws 等基础技能)。"""
+    for it in _skill_list():
         if isinstance(it, dict) and it.get("name") == name:
             return it.get("id")
     return None
+
+
+def _mounted_map(agent_out):
+    """agent get 的挂载技能列表 → {name: id}(用于「只在本 agent 已挂载范围内」按名认领)。"""
+    return {m.get("name"): m.get("id")
+            for m in (_dig(agent_out, "skills") or [])
+            if isinstance(m, dict) and m.get("name")}
 
 
 def _state_path(config_path):
@@ -700,17 +756,17 @@ def _save_state(config_path, state):
     )
 
 
-def _resolve_skill_id(name, cfg, state):
+def _resolve_skill_id(name, cfg, state, own=None):
+    """解析技能 name→id。顺序:配置 pin → 本 config 的 .sync-state → **本 agent 已挂载的同名技能**。
+    绝不做 workspace 全量按名认领 —— 否则两个 Agent 各有一个同名技能目录(如 `log`)时,B 会认领并
+    覆盖 A 的技能、还挂到 B 上。own = 本 agent 当前挂载的 {name: id}(调用方从 agent get 取)。"""
     pins = (cfg.get("multica") or {}).get("skills") or {}
     if name in pins:
         return pins[name], "pinned"
     if name in state.get("skills", {}):
         return state["skills"][name], "state"
-    listing, _ = multica(["skill", "list"])
-    items = listing if isinstance(listing, list) else _dig(listing, "skills") or []
-    for it in items if isinstance(items, list) else []:
-        if isinstance(it, dict) and it.get("name") == name:
-            return it.get("id"), "adopted"
+    if own and name in own:
+        return own[name], "adopted"
     return None, "new"
 
 
@@ -726,6 +782,7 @@ def push(cfg, work_dir, config_path, dry_run):
     prefix = mult.get("skill_name_prefix", "")
     base_names = mult.get("base_skills", ["dws"])
     state = _load_state(config_path)
+    own = _mounted_map(multica(["agent", "get", agent_id])[0])  # 本 agent 已挂载技能,认领只在此范围内
 
     entry = cfg["dingtalk"]["entry"]
     entry_content = (Path(work_dir) / entry).read_text(encoding="utf-8")
@@ -735,12 +792,11 @@ def push(cfg, work_dir, config_path, dry_run):
     plan.append(("agent.instructions", f"← {entry} ({len(entry_content)} 字)"))
     for sd in skill_dirs:
         name, desc = _skill_identity(sd, work_dir, prefix)
-        sid, origin = _resolve_skill_id(name, cfg, state)
+        sid, origin = _resolve_skill_id(name, cfg, state, own)
         refs = [p for p in sorted(sd.rglob("*.md")) if p.name != "SKILL.md"]
+        desc_disp = (desc[:32] + "…") if len(desc) > 32 else desc
         plan.append((f"skill:{name}",
-                     f"{'update' if sid else 'create'}({origin}) + {len(refs)} 附件 "
-                     f"| desc: {desc[:32]}…" if len(desc) > 32 else
-                     f"{'update' if sid else 'create'}({origin}) + {len(refs)} 附件 | desc: {desc}"))
+                     f"{'update' if sid else 'create'}({origin}) + {len(refs)} 附件 | desc: {desc_disp}"))
     for bn in base_names:
         bid = _resolve_by_name(bn)
         plan.append((f"base-skill:{bn}", "挂载" if bid else "⚠️ workspace 未找到,无法挂载"))
@@ -765,7 +821,7 @@ def push(cfg, work_dir, config_path, dry_run):
     for sd in skill_dirs:
         name, desc = _skill_identity(sd, work_dir, prefix)
         skill_md = str(sd / "SKILL.md")
-        sid, _ = _resolve_skill_id(name, cfg, state)
+        sid, _ = _resolve_skill_id(name, cfg, state, own)
         if sid:
             _, rc = multica(["skill", "update", sid, "--name", name,
                              "--description", desc, "--content-file", skill_md])
@@ -829,10 +885,14 @@ def set_kb_env(cfg):
     agent_id = mult.get("agent_id")
     root = cfg["dingtalk"]["source_node"]
     entry = cfg["dingtalk"]["entry"]
-    cur, _ = multica(["agent", "env", "get", agent_id])
-    # env get 回的是 {"agent_id":..,"custom_env":{...}};真正的 map 在 custom_env 里,别读错层。
-    ce = cur.get("custom_env") if isinstance(cur, dict) else None
-    env = dict(ce) if isinstance(ce, dict) else {}
+    # env set 是【整体替换】,必须先 get 再合并。若 get 没成功拿到 custom_env,绝不能拿 {} 去 set ——
+    # 那会把 agent 已有的全部环境变量抹掉、只剩这两个指针(静默数据丢失)。get 失败就直接告警返回。
+    cur, grc = multica(["agent", "env", "get", agent_id])
+    if grc != 0 or not isinstance(cur, dict) or cur.get("error") or "_raw" in cur \
+            or not isinstance(cur.get("custom_env"), dict):
+        print(f"  知识库环境变量:跳过(读取现有 custom_env 失败,不敢覆盖;多因非 owner/admin) ✗")
+        return False
+    env = dict(cur["custom_env"])
     env[KB_ROOT_ENV] = root
     env[KB_ENTRY_ENV] = entry
     tmp = None
@@ -871,19 +931,23 @@ def push_dingtalk(cfg, work_dir, config_path, dry_run):
         raise ConfigError("没有 rel→钉钉节点 映射。先跑一次 `pull` 或 `sync` 建立映射,再往钉钉写回。")
 
     prefix = mult.get("skill_name_prefix", "")
+    base_names = mult.get("base_skills", ["dws"])
     entry = cfg["dingtalk"]["entry"]
 
     # 收集 (label, node_id, Multica内容)
     targets, orphans = [], []
     agent_out, _ = multica(["agent", "get", agent_id])
+    own = _mounted_map(agent_out)
     instr = _dig(agent_out, "instructions") or ""
     if entry_node and instr:
         targets.append((entry, entry_node, instr))
     elif instr and not entry_node:
         orphans.append(entry)
+    seen_names = set()
     for sd in _skill_dirs(work_dir):
         name, _ = _skill_identity(sd, work_dir, prefix)
-        sid, _ = _resolve_skill_id(name, cfg, state)
+        seen_names.add(name)
+        sid, _ = _resolve_skill_id(name, cfg, state, own)
         if not sid:
             continue
         so, _ = multica(["skill", "get", sid])
@@ -902,16 +966,20 @@ def push_dingtalk(cfg, work_dir, config_path, dry_run):
                 targets.append((full, node_map[full], refcontent or ""))
             else:
                 orphans.append(full)
+    # Multica 侧独有、遍历不到的挂载技能(钉钉无对应节点):不能靠 work_dir 目录存在与否静默丢弃,列出来。
+    for extra in sorted(set(own) - seen_names - set(base_names)):
+        orphans.append(f"(Multica独有技能) {extra}")
 
     print(f"[push-dingtalk] Multica agent {agent_id} → 钉钉源文档(根 {dt.get('root')})"
           + (" —— 干跑(不写)" if dry_run else ""))
 
     # 逐个:读钉钉现状 → 容忍对比 → 有真漂移才排队写
-    writes = []
+    writes, read_fail = [], 0
     for label, node, content in targets:
-        remote, _rev, err = _read_dingtalk_doc(node)
+        remote, err = _read_dingtalk_markdown(node)   # 比对阶段只需正文,读一次
         if err:
             print(f"  {'· ' if dry_run else '→ '}{label}: 预读失败 ✗ ({err})")
+            read_fail += 1          # 预读失败=可能漏写,必须计入退出码,不能静默跳过报成功
             continue
         match = dingtalk_matches_source(remote, content)
         if match is not False:
@@ -925,18 +993,15 @@ def push_dingtalk(cfg, work_dir, config_path, dry_run):
 
     if dry_run:
         print("  (加 --yes 才会真正写回钉钉)")
-        return 0
-    if not writes:
-        print("[push-dingtalk] 钉钉侧已全部一致,无需写回")
-        return 0
-
-    fail = 0
+        return 1 if read_fail else 0
+    fail = read_fail
     for label, node, content, remote in writes:
         status, msg = _write_dingtalk_node(node, content, remote)
         ok = status in ("written", "already")
         print(f"  {label}: {'✓ ' if ok else '✗ '}{status} ({msg})")
         fail += not ok
-    print(f"[push-dingtalk] 完成,失败 {fail} 项")
+    tail = f"(含 {read_fail} 预读失败)" if read_fail else ""
+    print(f"[push-dingtalk] {'钉钉侧已全部一致,无需写回' if not fail and not writes else f'完成,失败 {fail} 项'}{tail}")
     return fail
 
 
@@ -952,14 +1017,18 @@ def verify(cfg, work_dir, config_path):
     results = []
 
     entry = cfg["dingtalk"]["entry"]
-    entry_content = (Path(work_dir) / entry).read_text(encoding="utf-8")
+    entry_path = Path(work_dir) / entry
+    if not entry_path.is_file():
+        raise ConfigError(f"工作区 {work_dir} 里没有 {entry};先跑一次 pull/sync 再 verify。")
+    entry_content = entry_path.read_text(encoding="utf-8")
     agent_out, _ = multica(["agent", "get", agent_id])
+    own = _mounted_map(agent_out)
     results.append(("agent.instructions",
                     _text_equal(_dig(agent_out, "instructions"), entry_content)))
 
     for sd in _skill_dirs(work_dir):
         name, _ = _skill_identity(sd, work_dir, prefix)
-        sid, _ = _resolve_skill_id(name, cfg, state)
+        sid, _ = _resolve_skill_id(name, cfg, state, own)
         if not sid:
             results.append((f"skill:{name}", False))
             continue
@@ -1005,6 +1074,7 @@ def quality_check(cfg, work_dir, config_path):
     mounted = _dig(agent_out, "skills") or []
     mounted_ids = {m.get("id") for m in mounted if isinstance(m, dict)}
     mounted_names = {m.get("name") for m in mounted if isinstance(m, dict)}
+    own = _mounted_map(agent_out)
 
     # checks: (label, ok, detail, hard)。hard=True 才计入失败;hard=False 只是提示。
     checks = [("instructions 非空", len(instructions.strip()) > 0, f"{len(instructions)} 字", True)]
@@ -1035,7 +1105,7 @@ def quality_check(cfg, work_dir, config_path):
     no_name, no_desc, empty_content, not_mounted = [], [], [], []
     for sd in skill_dirs:
         name, _ = _skill_identity(sd, work_dir, prefix)
-        sid, _ = _resolve_skill_id(name, cfg, state)
+        sid, _ = _resolve_skill_id(name, cfg, state, own)
         if not sid:
             no_name.append(name)
             not_mounted.append(name)

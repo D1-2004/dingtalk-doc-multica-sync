@@ -61,13 +61,18 @@ python3 scripts/sync.py sync --yes
 - **写前干跑**:`sync` 默认不写,先打印计划;`--yes` 才落 Multica。
 - **skill 去重**:同名 skill 靠 `.sync-state.json`(name→id)记住,重跑是更新而非重复创建;跨 Agent 撞名用 `multica.skill_name_prefix` 隔离。
 
-## 导入到 Multica
+## 装进 Multica(闭环用法)
+
+先导入技能库:
 
 ```bash
 multica skill import --url https://github.com/d1-2004/dingtalk-doc-multica-sync
 ```
 
-导入后,给要管的 agent 挂上本 skill,填好 `agents.md`,即可在 Multica 侧发起同步。
+- **创建智能体时把它加进技能集** —— 智能体自此带着「从钉钉文档节点同步定义」的能力。填好 `agents.md`,跑 `sync --yes`,它的 instructions 与技能就从文档拉齐。
+- **也是一份写 instruction 的说明** —— 目标 agent 的 `instructions` 应当就是钉钉里的入口文档(`AGENTS.md`)。等价命令:`multica agent update <agent-id> --instructions "$(cat .agent-workspace/AGENTS.md)"`。
+
+闭环:本 skill 既是挂在智能体上的一个技能,又是维护这个智能体定义的工具 —— 同步对象可以正是它自己所在的 agent。改文档 → 重新同步 → 定义更新 → 回到文档。
 
 ## 绑定配置
 

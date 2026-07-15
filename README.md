@@ -82,19 +82,30 @@ python3 scripts/sync.py sync --yes
 2. **push** — 入口文档 → `multica agent update --instructions`;每个 `skills/<name>/` → `multica skill create/update`(+ `skill files upsert` 附件)→ `multica agent skills add` 挂载。name→id 存进 `.sync-state.json`,重跑是更新而非重复创建。
 3. **verify** — `multica agent get` / `multica skill get` 回读,与本地物化逐一比对(接口 success 不算数,内容一致才算)。
 
-## 导入到 Multica
+## 怎么用:装进 Multica,形成闭环
 
-本 skill 支持直接导入:
+这个 skill 不是给人在本地手跑一次就完的 —— 它是**装进 Multica 智能体里的一块**。两种用法互相咬合成一个闭环。
+
+**用法一:创建智能体时,把它加进技能集(主用法)**
+
+先把它导入 Multica 的技能库:
 
 ```bash
 multica skill import --url https://github.com/d1-2004/dingtalk-doc-multica-sync
 ```
 
-导入后把它挂到要管的 agent 上,填好 `agents.md`,即可发起同步。
+创建智能体时,把 `dingtalk-doc-multica-sync` 加进这个智能体的技能集。之后智能体自己就带着「从钉钉文档节点同步定义」的能力:填好 [`agents.md`](./agents.md) 的绑定,跑一次 `python3 scripts/sync.py sync --yes`,它的 instructions 与技能就从文档拉齐。
 
-## 与「钉钉原生 Agent」底座的关系
+**用法二:指导你写 Multica 的 instruction(已经有 multica CLI 时)**
 
-这个 skill 是钉钉原生 Agent 范式的一块:Agent 的定义外挂在钉钉文档,干净工作区从文档拉起,钉钉是唯一持久层。完整底座(创建 / 冷启动 boot / 自管理 / 自进化)见 [`D1-2004/dingtalk-agent`](https://github.com/D1-2004)。本仓库只做一件事,并把它做干净:**把定义从文档同步到 Multica agent**。
+如果你已经在用 multica CLI,这个 skill 同时是一份「怎么把绑定写进 agent instructions」的说明:目标 agent 的 `instructions` 应当**就是钉钉里的入口文档**(`AGENTS.md`)—— 指向哪个钉钉节点、入口是什么、何时触发同步,都在 `agents.md` 与上面「它怎么工作」里写清了。等价的一条命令:
+
+```bash
+# 把入口文档(钉钉 AGENTS.md)写成 agent 的 instructions
+multica agent update <agent-id> --instructions "$(cat .agent-workspace/AGENTS.md)"
+```
+
+**闭环。** 本 skill 既是**挂在智能体上的一个技能**,又是**维护这个智能体定义的工具** —— 它同步的对象,可以正是它自己所在的那个 agent。改钉钉文档 → agent 重新同步 → instructions 与技能一起更新 → 再回到文档。定义、技能、运行三者从此同源自洽。
 
 ## 设计取舍与坑
 

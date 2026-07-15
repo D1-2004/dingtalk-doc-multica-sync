@@ -1,0 +1,10 @@
+# 物化的 Agent 工作区(从钉钉拉下来的定义,可随时重拉,不入库)
+.agent-workspace/
+
+# 同步状态(某 workspace 的 skill name->id 映射,环境相关,不入库)
+.sync-state.json
+
+# Python
+__pycache__/
+*.py[cod]
+.DS_Store

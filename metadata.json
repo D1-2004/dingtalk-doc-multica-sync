@@ -1,0 +1,10 @@
+{
+  "version": "1.0.0",
+  "organization": "D1-2004",
+  "date": "July 2026",
+  "abstract": "Bind a Multica agent to a DingTalk document knowledge base: given a DingTalk root node, actively sync the agent's core definitions (entry AGENTS.md into instructions, and each skills/<name>/ into a mounted Multica skill) with pull -> push -> read-back verify. Dynamic data (memories/storage) is intentionally out of scope, left to DWS runtime hydration in phase two.",
+  "references": [
+    "https://github.com/d1-2004/dingtalk-doc-multica-sync",
+    "https://github.com/D1-2004/dingtalk-agent"
+  ]
+}

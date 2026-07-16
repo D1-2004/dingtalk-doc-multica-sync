@@ -26,7 +26,6 @@
   - 接口 success ≠ 内容真写入:写完一律 `skill get`/`agent get` 回读比对才算成功。
 """
 import argparse
-import html
 import json
 import os
 import re
@@ -198,58 +197,122 @@ def _normalize_source_markdown(value):
     return "\n".join(lines).strip()
 
 
+def _fence_len(line):
+    """代码围栏行 → (符号, 长度);否则 None。长度感知:```` 开的块要 ≥4 同种符号才收(嵌套用)。"""
+    s = line.lstrip()
+    mobj = re.match(r"(`{3,}|~{3,})", s)
+    return (s[0], len(mobj.group(1))) if mobj else None
+
+
+def _fence_spans(lines):
+    """逐行标注是否属于代码(围栏标记行 + 代码内部行都逐字对待,is_code=True;散文 False)。
+    正确处理嵌套/变长围栏:4 反引号块里的 3 反引号是内容,不误当收栏。所有 fence 逻辑共此一处。"""
+    fence = None  # 开着时为 (char, len)
+    for line in lines:
+        fl = _fence_len(line)
+        if fence is None:
+            if fl:
+                fence = fl
+            yield line, bool(fl)
+        else:
+            ch, ln = fence
+            if fl and fl[0] == ch and fl[1] >= ln and set(line.strip()) == {ch}:
+                fence = None                # 收栏:同种符号、长度 ≥ 开栏、整行只有该符号
+            yield line, True
+
+
+# 注意:字符类**不含 `|`** —— 表格单元格里 `\|` 是 GFM 的字面竖线,反解会把 2 格表变 3 格(结构损坏)。
+_ADOC_ESC_RE = re.compile(r"\\([+\[\]_><{}().$])")
+_INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+
+
+def _unescape_adoc_prose(text):
+    """在一行【散文】里反解 adoc 转义,迭代到不动点(幂等);行内代码 `...` 原样跳过。"""
+    def stable(s):
+        for _ in range(20):                # 迭代到不动点:n 个连续反斜杠需 n 轮,上限放宽保幂等
+            nxt = _ADOC_ESC_RE.sub(r"\1", s)
+            if nxt == s:
+                return s
+            s = nxt
+        return s
+    out, i = [], 0
+    for mobj in _INLINE_CODE_RE.finditer(text):
+        out.append(stable(text[i:mobj.start()]))
+        out.append(mobj.group(0))          # 行内代码:原样
+        i = mobj.end()
+    out.append(stable(text[i:]))
+    return "".join(out)
+
+
 def _unescape_adoc(value):
-    """反解一层 adoc 转义(\\_ \\* \\| ...),保留源文件里真正的反斜杠。"""
-    sentinel = chr(0) + "DWS_BS" + chr(0)   # 空字节哨兵:正文不可能出现,零碰撞
-    value = (value or "").replace("\\\\", sentinel)
-    value = re.sub(r"\\([+\[\]_><{}().$|])", r"\1", value)
-    return value.replace(sentinel, "\\")
+    """反解 adoc 反斜杠转义——**只在散文里做**。钉钉在代码块/行内代码里用 HTML 实体转义
+    (见 _html_unescape_fully),不用反斜杠;代码里的 `\\.` `\\|` `\\$` 是真实内容,碰了就把
+    regex/shell 改错(实测会把真改动误判成一致而漏写回)。迭代到不动点,保证 normalize 幂等
+    (pull 与 compare 两次归一化不漂移)。"""
+    out = []
+    for line, is_code in _fence_spans((value or "").split("\n")):
+        out.append(line if is_code else _unescape_adoc_prose(line))  # 代码逐字,散文才反解
+    return "\n".join(out)
 
 
-def _html_unescape_fully(value):
-    """钉钉在代码块里会【双重】HTML 转义(`&amp;#95;` = `_`),一次 unescape 解不完。
-    收敛式反解到不再变化为止(设上限防病态输入死循环)。"""
-    v = value or ""
-    for _ in range(5):
-        nxt = html.unescape(v)
-        if nxt == v:
-            break
-        v = nxt
-    return v
+def _unratchet_entities(md):
+    """只反解钉钉的【棘轮】:它在代码块把 `_`/`*`/`` ` `` 转义成 `&#95;`/`&#42;`/`&#96;`,重写会叠出多层
+    `&amp;`(实测到 8 层)。**只解这三个字符**,任意 `&amp;` 深度 —— 绝不碰 `&lt;` `&#43;` `&amp;`
+    这些其它实体(实测钉钉单次往返对代码内容逐字保留,它们是真实内容,解了就改坏 HTML/regex/shell 示例)。"""
+    md = re.sub(r"&(?:amp;)*#42;", "*", md or "")
+    md = re.sub(r"&(?:amp;)*#95;", "_", md)
+    md = re.sub(r"&(?:amp;)*#96;", "`", md)
+    return md
 
 
 def normalize_dingtalk_markdown(value):
     """把钉钉回读的 markdown 反解成干净源码 —— 物化到本地/推给 Multica 前都过这道。
-    旧实现只 html.unescape 一次,会留下 `&#95;` 残渣(失真);现在收敛反解 + 对称去 adoc 转义。"""
-    return _normalize_source_markdown(_unescape_adoc(_html_unescape_fully(value)))
+    三步都幂等(pull 与 compare 两次归一化不漂移):反棘轮实体(仅 _ * `)→ 散文里去 adoc 转义 → 归一空白。"""
+    return _normalize_source_markdown(_unescape_adoc(_unratchet_entities(value)))
 
 
-def _render_equivalent(value):
-    """渲染等价视图:折叠钉钉自动 linkify 的 [文本](节点URL)、去行内强调符、归一化表格
-    分隔线与空白 —— 把「钉钉重排版」这类表现层差异和「内容真被改」区分开。"""
-    v = re.sub(r"[（(]?\[打开\]\(https://alidocs\.dingtalk\.com/[^)]*\)[)）]?", "", value or "")
-    v = re.sub(r"\[([^\]]*)\]\(https://alidocs\.dingtalk\.com/[^)]*\)", r"\1", v)
-    # 钉钉把 _斜体_ 归一成 *斜体*:只归一「非词内」的成对下划线强调,不碰 snake_case / CLI 标识 —
-    # 否则 user_id→userid、run_in_background→runinbackground 这类**真改动**会被误判成等价(假阴,漏写回)。
-    v = re.sub(r"(?<![0-9A-Za-z])_(\S(?:[^_\n]*\S)?)_(?![0-9A-Za-z])", r"*\1*", v)
-    v = re.sub(r"\*{1,3}", "", v)          # 钉钉会重排加粗/斜体边界
+def _emphasis_fold(seg):
+    # _斜体_ ↔ *斜体*:只归一「非词内」成对下划线强调,不碰 snake_case / CLI 标识 —— 否则
+    # user_id→userid、run_in_background→runinbackground 这类真改动会被误判成等价(假阴,漏写回)。
+    seg = re.sub(r"(?<![0-9A-Za-z])_(\S(?:[^_\n]*\S)?)_(?![0-9A-Za-z])", r"*\1*", seg)
+    return re.sub(r"\*{1,3}", "", seg)
+
+
+def _render_equivalent_prose(v):
+    """一行【散文】的渲染等价视图:折叠钉钉 linkify、归一强调符、表格分隔线、去空白。
+    行内代码 `...` **逐字保留** —— 里面的 `*`/`_` 是代码内容(如 `*args`/`__init__`),折了就把真改动吃掉。"""
+    # 钉钉给 baseId/nodeId 自挂的装饰链接**总是带括号** `([打开](url))` —— 只删带括号的装饰,
+    # 不删用户手写的裸 `[打开](url)`(那由下一条保 URL 处理),否则改这种链接的指向会被静默吞掉。
+    v = re.sub(r"[（(]\[打开\]\(https://alidocs\.dingtalk\.com/[^)]*\)[)）]", "", v or "")
+    # 折叠 alidocs 链接但**保留目标 URL** —— 只改链接指向(节点 AAA→BBB)是真改动,不能连 URL 一起丢。
+    v = re.sub(r"\[([^\]]*)\]\(https://alidocs\.dingtalk\.com/([^)]*)\)", r"\1 \2", v)
     v = re.sub(r"^\s*>\s?", "", v)         # 钉钉会丢引用块的 > 前缀
     if re.match(r"^[\s|:\-]+$", v):        # 仅表格分隔行才折叠连字符(|----|→|---|),不碰 --flag/代码里的 -
         v = re.sub(r"-{2,}", "-", v)
-    v = re.sub(r"[ \t]+", "", v)
-    return v
+    # 强调折叠只在【行内代码之外】做,行内代码逐字
+    out, i = [], 0
+    for mobj in _INLINE_CODE_RE.finditer(v):
+        out.append(_emphasis_fold(v[i:mobj.start()]))
+        out.append(mobj.group(0))
+        i = mobj.end()
+    out.append(_emphasis_fold(v[i:]))
+    return re.sub(r"[ \t]+", "", "".join(out))
+
+
+def _render_equivalent_doc(lines):
+    """整篇的渲染等价视图:**代码块内逐字保留**(strict 已用 normalize 归一,不能再模糊折叠,
+    否则代码里的 `>`/`*`/`-` 真改动被吃),只有散文行才做钉钉重排版的等价折叠。"""
+    out = []
+    for line, is_code in _fence_spans(lines):
+        out.append(line if is_code else _render_equivalent_prose(line))
+    return "".join(out)
 
 
 def _markdown_content_lines(value):
-    """比对时容忍钉钉对外层空行的压缩(代码块内原样保留)。"""
-    lines, fence = [], None
-    for line in value.split("\n"):
-        stripped = line.lstrip()
-        marker = next((m for m in ("```", "~~~") if stripped.startswith(m)), None)
-        if marker:
-            lines.append(line)
-            fence = None if fence == marker else marker
-        elif line.strip() or fence:
+    """比对时容忍钉钉对外层空行的压缩(代码块内原样保留);用长度感知的共享 fence 逻辑。"""
+    lines = []
+    for line, is_code in _fence_spans(value.split("\n")):
+        if is_code or line.strip():
             lines.append(line)
     return tuple(lines)
 
@@ -261,17 +324,15 @@ def dingtalk_matches_source(remote, source):
     s = _markdown_content_lines(normalize_dingtalk_markdown(source))
     if r == s:
         return True
-    if "".join(_render_equivalent(x) for x in r) == "".join(_render_equivalent(x) for x in s):
+    if _render_equivalent_doc(r) == _render_equivalent_doc(s):
         return "render"
     return False
 
 
 def _unratchet(md):
-    """拆 HTML 实体棘轮:钉钉把行内代码里的 `_`/`*`/反引号转义,回读再写回会一层层恶化
-    (最坏烂到 8 层 → 正文乱码且再也同步不进)。写回前一律拆干净。"""
-    md = re.sub(r"&(?:amp;)*#42;", "*", md)
-    md = re.sub(r"&(?:amp;)*#95;", "_", md)
-    md = re.sub(r"&(?:amp;)*#96;", "`", md)
+    """写回前彻底反棘轮:实体棘轮(_ * `,任意 &amp; 深度)+ 行内代码里被塞进的 `**` 起点。
+    回读再写回会一层层恶化(最坏 8 层 → 乱码且再也同步不进),写回前一律拆干净。"""
+    md = _unratchet_entities(md)
     md = re.sub(r"`\*\*([^`\n]+?)\*\*`", r"`\1`", md)
     return md
 
@@ -285,11 +346,20 @@ def _text_equal(a, b):
 #  往钉钉写回(Multica → 钉钉):保真写入 = 钉钉原生解析器渲 JSONML + 乐观锁 + 回读
 # --------------------------------------------------------------------------- #
 def _read_dingtalk_doc(node_id):
-    """读钉钉正文 + revision(乐观锁用)。返回 (markdown, revision, error)。"""
-    ver, vrc = dws(["doc", "read", "--node", node_id, "--content-format", "jsonml"])
-    revision = ver.get("revision") if isinstance(ver, dict) else None
-    if vrc != 0 or not revision or ver.get("error"):
-        return None, None, (ver.get("error") or ver.get("_raw") or vrc)
+    """读钉钉正文 + revision(乐观锁用)。返回 (markdown, revision, error)。
+    刚写完的大文档偶发「读成功但 revision 还没落」(读追上写),对无 revision 做几次退避重试。"""
+    ver, revision = {}, None
+    for attempt in range(3):
+        ver, vrc = dws(["doc", "read", "--node", node_id, "--content-format", "jsonml"])
+        revision = ver.get("revision") if isinstance(ver, dict) else None
+        if vrc == 0 and revision and not ver.get("error"):
+            break
+        if attempt < 2:
+            time.sleep(1.0 * (attempt + 1))
+    if not revision or ver.get("error"):
+        # 兜底哨兵:读成功但没 revision 时,error 不能是 0(假值)——否则调用方以为读成功、
+        # 拿着 revision=None 去写 `--revision None` 必失败。给一个真值错因。
+        return None, None, (ver.get("error") or ver.get("_raw") or "文档无 revision(空文档?)")
     out, rc = dws(["doc", "read", "--node", node_id])
     if rc == 0 and not out.get("error") and "markdown" in out:
         return out["markdown"], revision, None

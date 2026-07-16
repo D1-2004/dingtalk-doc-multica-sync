@@ -727,12 +727,22 @@ def _frontmatter(md):
 
 
 def _skill_dirs(work_dir):
+    """只返回 SKILL.md **有内容** 的技能目录;空 SKILL.md(上游还没写完的 WIP)记进 skipped_empty
+    并跳过 —— multica 对空 --content-file 会直接报错,不该让一个半成品上游文档拖垮整条同步。"""
     skills_root = Path(work_dir) / "skills"
+    _skill_dirs.skipped_empty = []
     if not skills_root.is_dir():
         return []
     out = []
     for skill_md in sorted(skills_root.rglob("SKILL.md")):
-        out.append(skill_md.parent)
+        try:
+            has_content = bool(skill_md.read_text(encoding="utf-8").strip())
+        except OSError:
+            has_content = False
+        if has_content:
+            out.append(skill_md.parent)
+        else:
+            _skill_dirs.skipped_empty.append(skill_md.parent.name)
     return out
 
 
@@ -861,6 +871,8 @@ def push(cfg, work_dir, config_path, dry_run):
     entry = cfg["dingtalk"]["entry"]
     entry_content = (Path(work_dir) / entry).read_text(encoding="utf-8")
     skill_dirs = _skill_dirs(work_dir)
+    if _skill_dirs.skipped_empty:
+        print(f"  ⚠️ 跳过空 SKILL.md 技能(上游疑似 WIP,不同步): {_skill_dirs.skipped_empty}")
 
     plan = []
     plan.append(("agent.instructions", f"← {entry} ({len(entry_content)} 字)"))
@@ -908,9 +920,12 @@ def push(cfg, work_dir, config_path, dry_run):
             fail += 1
             continue
         state.setdefault("skills", {})[name] = sid
-        # 附件(references/*.md 等)按相对 skill 目录的路径 upsert
+        # 附件(references/*.md 等)按相对 skill 目录的路径 upsert;空文件跳过(upsert 对空内容会报错)
         for ref in sorted(sd.rglob("*.md")):
             if ref.name == "SKILL.md":
+                continue
+            if not ref.read_text(encoding="utf-8").strip():
+                print(f"    ↳ 跳过空附件 {ref.name}(上游 WIP)")
                 continue
             rel = ref.relative_to(sd).as_posix()
             _, rc = multica(["skill", "files", "upsert", sid, "--path", rel,

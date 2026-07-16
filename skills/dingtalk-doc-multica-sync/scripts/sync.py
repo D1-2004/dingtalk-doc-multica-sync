@@ -128,6 +128,14 @@ def _dig(data, *keys):
     return None
 
 
+def _write_tmp(text, suffix):
+    """写一份临时文件返回其路径;调用方在 finally 里 os.unlink 清理。"""
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=suffix,
+                                     delete=False) as f:
+        f.write(text)
+        return f.name
+
+
 # --------------------------------------------------------------------------- #
 #  同步配置(agents.md 里的 ```json 代码块)
 # --------------------------------------------------------------------------- #
@@ -397,9 +405,7 @@ def _render_markdown_jsonml(target_node, content):
     scratch_name = "dtsync-render-" + uuid.uuid4().hex
     scratch, rendered, error, tmp = None, None, None, None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".md", delete=False) as f:
-            f.write(content)
-            tmp = f.name
+        tmp = _write_tmp(content, ".md")
         created, _ = dws(["doc", "create", "--name", scratch_name, "--folder", folder_id, "--yes"])
         scratch = _dig(created, "nodeId", "dentryUuid", "fileId")
         # 铁律:doc create 会【报错但其实建成功】—— 不看信封,按名回查
@@ -470,9 +476,7 @@ def _write_dingtalk_node(node_id, expected_content, baseline_remote):
         return "conflict", "初读后钉钉侧又变了,拒绝覆盖(防丢并发编辑)"
     tmp = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", delete=False) as f:
-            json.dump({"jsonml": rendered}, f, ensure_ascii=False)
-            tmp = f.name
+        tmp = _write_tmp(json.dumps({"jsonml": rendered}, ensure_ascii=False), ".json")
         out, rc = dws(["doc", "update", "--node", node_id, "--content-file", tmp,
                        "--content-format", "jsonml", "--mode", "overwrite",
                        "--revision", str(revision), "--yes"])
@@ -960,16 +964,14 @@ def set_kb_env(cfg):
     cur, grc = multica(["agent", "env", "get", agent_id])
     if grc != 0 or not isinstance(cur, dict) or cur.get("error") or "_raw" in cur \
             or not isinstance(cur.get("custom_env"), dict):
-        print(f"  知识库环境变量:跳过(读取现有 custom_env 失败,不敢覆盖;多因非 owner/admin) ✗")
+        print("  知识库环境变量:跳过(读取现有 custom_env 失败,不敢覆盖;多因非 owner/admin) ✗")
         return False
     env = dict(cur["custom_env"])
     env[KB_ROOT_ENV] = root
     env[KB_ENTRY_ENV] = entry
     tmp = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", delete=False) as f:
-            json.dump(env, f, ensure_ascii=False)
-            tmp = f.name
+        tmp = _write_tmp(json.dumps(env, ensure_ascii=False), ".json")
         out, rc = multica(["agent", "env", "set", agent_id, "--custom-env-file", tmp])
         ok = rc == 0 and not (isinstance(out, dict) and out.get("_raw"))
         print(f"  知识库环境变量 {KB_ROOT_ENV}={root} / {KB_ENTRY_ENV}={entry} → agent: "
@@ -1071,7 +1073,8 @@ def push_dingtalk(cfg, work_dir, config_path, dry_run):
         print(f"  {label}: {'✓ ' if ok else '✗ '}{status} ({msg})")
         fail += not ok
     tail = f"(含 {read_fail} 预读失败)" if read_fail else ""
-    print(f"[push-dingtalk] {'钉钉侧已全部一致,无需写回' if not fail and not writes else f'完成,失败 {fail} 项'}{tail}")
+    summary = "钉钉侧已全部一致,无需写回" if not fail and not writes else f"完成,失败 {fail} 项"
+    print(f"[push-dingtalk] {summary}{tail}")
     return fail
 
 

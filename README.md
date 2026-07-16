@@ -132,7 +132,7 @@ multica agent update <agent-id> --instructions "$(cat .agent-workspace/AGENTS.md
 
 ```
 dingtalk-doc-multica-sync/
-├── README.md · LICENSE · agents.md · metadata.json   ← 给人看的仓库脚手架
+├── README.md · LICENSE · agents.md   ← 给人看的仓库脚手架 + 绑定配置模板
 └── skills/dingtalk-doc-multica-sync/                  ← 干净的技能本体
     ├── SKILL.md
     └── scripts/sync.py
